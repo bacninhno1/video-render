@@ -2,7 +2,7 @@ name: Process Video Job
 
 on:
   repository_dispatch:
-    types: [new_video_job]
+    types: [video_job]
 
 jobs:
   ffmpeg-job:
