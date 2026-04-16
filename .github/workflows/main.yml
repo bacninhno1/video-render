@@ -6,58 +6,66 @@ on:
 
 jobs:
   ffmpeg-job:
+    # Dùng thẳng môi trường Ubuntu của GitHub để có sẵn curl, jq, ffmpeg
     runs-on: ubuntu-latest
-    container:
-      image: jrottenberg/ffmpeg:6.0-ubuntu
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Install additional tools
-        run: |
-          apt-get update -qq
-          apt-get install -y jq curl
-
-      - name: Debug FFmpeg
-        run: ffmpeg -version
+      # KHÔNG CẦN bước cài đặt tools vì ubuntu-latest đã có sẵn hết
 
       - name: Download Input Video & Intro
         run: |
-          echo "Preparing video URLs..."
+          set -e
           VIDEO_URL="${{ github.event.client_payload.video_url }}"
           INTRO_URL="${{ github.event.client_payload.intro_url }}"
 
-          # mask để không lộ ra log
           echo "::add-mask::$VIDEO_URL"
           echo "::add-mask::$INTRO_URL"
 
-          echo "Downloading main video..."
-          curl -s -L -o input.mp4 "$VIDEO_URL"
+          echo "⬇ Downloading main video..."
+          # --retry 3 giúp tự động tải lại nếu mạng lag
+          curl -L --fail --retry 3 -o input.mp4 "$VIDEO_URL"
 
           if [ ! -z "$INTRO_URL" ] && [ "$INTRO_URL" != "0" ]; then
-            echo "Downloading intro..."
-            curl -s -L -o intro.mp4 "$INTRO_URL"
+            echo "⬇ Downloading intro..."
+            curl -L --fail --retry 3 -o intro.mp4 "$INTRO_URL"
           else
-            echo "No intro provided, skipping..."
+            echo "No intro provided."
           fi
 
       - name: Run FFmpeg Video Processing
         run: |
+          set -e
           chmod +x process_video.sh
+          
           INTRO_FILE=""
-          if [ -f intro.mp4 ] && [ -s intro.mp4 ]; then
-            INTRO_FILE="intro.mp4"
+          [ -s intro.mp4 ] && INTRO_FILE="intro.mp4"
+
+          echo "🚀 Processing video..."
+          ./process_video.sh \
+            input.mp4 \
+            "$INTRO_FILE" \
+            "${{ github.event.client_payload.flip }}" \
+            output_final.mp4
+
+          if [ ! -s output_final.mp4 ]; then
+            echo "❌ Error: FFmpeg failed to produce output."
+            exit 1
           fi
-          ./process_video.sh input.mp4 "$INTRO_FILE" "${{ github.event.client_payload.flip }}" output_final.mp4
 
       - name: Upload Processed Video & Callback
         run: |
-          echo "Uploading final video..."
+          set -e
+          echo "⬆ Uploading final video..."
+          
+          # Lưu response và kiểm tra HTTP code
           response=$(curl -s -w "%{http_code}" -o upload_response.json \
                      -F "file=@output_final.mp4" \
                      "${{ secrets.UPLOAD_URL }}")
-          status_code=$(printf "%s" "$response" | tail -c 3)
-          body=$(cat upload_response.json)
+          
+          status_code=$(echo "$response" | tail -c 3)
 
           if [ "$status_code" != "200" ]; then
             echo "❌ Upload failed! HTTP $status_code"
@@ -65,18 +73,25 @@ jobs:
             exit 1
           fi
 
-          output_url=$(echo "$body" | jq -r '.output_url')
-          echo "::add-mask::$output_url"
+          # Dùng jq trích xuất URL an toàn (xử lý được trường hợp null/trống)
+          output_url=$(jq -r '.output_url // empty' upload_response.json)
 
-          if [ "$output_url" = "null" ] || [ -z "$output_url" ]; then
-            echo "❌ Upload failed! No output_url returned."
+          if [ -z "$output_url" ]; then
+            echo "❌ Error: No output_url found in response."
             exit 1
           fi
 
-          echo "✅ Upload thành công, link đã được mask."
+          echo "::add-mask::$output_url"
+          echo "✅ Upload thành công."
 
-          echo "Sending callback..."
+          # Dùng jq để tạo JSON callback an toàn tuyệt đối
+          CALLBACK_DATA=$(jq -n \
+            --arg id "${{ github.event.client_payload.job_id }}" \
+            --arg url "$output_url" \
+            '{job_id: $id, output_url: $url}')
+
+          echo "📡 Sending callback..."
           curl -s -X POST -H "Content-Type: application/json" \
-               -d '{"job_id": "'"${{ github.event.client_payload.job_id }}"'", "output_url": "'"$output_url"'"}' \
+               -d "$CALLBACK_DATA" \
                "${{ secrets.CALLBACK_URL }}"
           echo "✅ Callback sent."
